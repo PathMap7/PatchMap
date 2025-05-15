@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import torchvision
 import torch.nn.functional
 from tqdm import tqdm
-
+import json
 
 set_all_seed(42)
 
@@ -64,11 +64,14 @@ class ImageNetDataset(torch.utils.data.Dataset):
         self.bboxes = glob("ImageNet/imagenet_bbox/*")
         self.transforms = transforms
         self.det = det
+        self.inds = torch.load("assets/imagenet_inds.pth")
         
     def __len__(self):
+        return len(self.inds)
         return len(self.imgs)
     
     def __getitem__(self, idx):
+        idx = self.inds[idx]
         ## return img, y, bbox
         img = cv2.imread(self.imgs[idx]) / 255
         # get bbox
@@ -90,6 +93,34 @@ class ImageNetDataset(torch.utils.data.Dataset):
         # return torch.from_numpy(img), self.labels[idx], torch.tensor(bbox)
         
         
+def load_data(all_values):
+    cls = list(all_values[0].items())[0][1]
+    n = all_values[1]['(0, 0)'].shape[-1]
+    scale = 2
+    size = 224
+    arr = torch.zeros(size//scale,size//scale, n)
+    arr_soft = torch.zeros(size//scale,size//scale, n)
+    for k in (all_values[1].keys()):
+        inds = torch.tensor(json.loads(k.replace("(","[").replace(")","]")))
+        inds = (112 + inds) // scale ## for 112X112 values
+        arr[tuple(inds)] = all_values[1][k]
+        arr_soft[tuple(inds)] = all_values[2][k]
+    arr_soft, arr = arr_soft.permute(2,0,1).clone().detach(), arr.permute(2,0,1).clone().detach()
+    return arr, arr_soft
+
+class ImageLocationDataset(torch.utils.data.Dataset):
+    def __init__(self, data=[]):
+        data = [load_data(i) for i in (data)]
+        self.arr, self.arr_soft = [torch.cat([i[j] for i in data], dim=0) for j in range(2)]
+
+    def __len__(self):
+        return self.arr.shape[0]
+
+    def __getitem__(self, idx):
+        return self.arr_soft[idx], self.arr[idx]
+        
+        
+        
 ##================================================================================================================
 # Choose an integer in the range 0-9 to select the patch
 patch_id = args.patch
@@ -105,6 +136,7 @@ apply_patch = ApplyPatch(patch, patch_size=info['patch_size'],
                          rotation_range=(-0, 0),
                          scale_range=(patch_size, patch_size)           # scale range wrt image dimensions,
                          )
+print("patch size:" + str(patch_size))
 
 # For convenience the preprocessing steps are splitted to compute also the clean predictions
 normalizer = Normalize(mean=[0.485, 0.456, 0.406],
@@ -152,52 +184,73 @@ start = args.start // batch_size
 end = args.end // batch_size
 
 
-sizes = [0.5, 0.3, 0.1]
-for s in sizes:
-  apply_patch = ApplyPatch(patch, patch_size=info['patch_size'],
-                         translation_range=(.0, .0),
-                         rotation_range=(-0, 0),
-                         scale_range=(s, s)           # scale range wrt image dimensions,
-                         )
+'''
+y_confidance = []
+y_pred = []
+for x, y, tr in tqdm(data_loader):
+  x = x.float().cuda()
+  pred = model(x).cpu()
+  pred = torch.nn.functional.softmax(pred, dim=1)
+  predicted = pred.argmax(dim=1)
+  pred = pred[:,pred.argmax(dim=1)]
+  pred = torch.tensor([pred[i,i] for i in range(10)])
+  y_confidance.append(pred.cpu().clone().detach())
+  y_pred.append(predicted.cpu().clone().detach())
+
+#torch.save(torch.cat(y_confidance, dim=0), "dataset/baseline_confidance.pt")
+torch.save(torch.cat(y_pred, dim=0), "dataset/baseline_pred.pt")
+exit(0)
+'''
+
+#for _ in range(start):
+#  x, y, tr = next(it)
+#bar = tqdm(range(start, end))
+os.makedirs("temp_dataset/effect_stats")
+bar = tqdm(data_loader)
+for b_idx in bar:
+  x, y, tr = next(it)
+  preds = [{},{}, {}, {}]
+  for i in range(-112,112,2):
+      for j in range(-112,112,2):
+        ## load data
+        # x, y = next(iter(data_loader))  # load a mini-batch
+        x_clean = normalizer(x).float().cuda()
   
-  for _ in range(start):
-    x, y, tr = next(it)
-  for b_idx in tqdm(range(start, end)):
-    x, y, tr = next(it)
-    preds = [{},{}, {}, {}]
-    for i in tqdm(range(-112,112,2)):
-        for j in (range(-112,112,2)):
-          ## load data
-          # x, y = next(iter(data_loader))  # load a mini-batch
-          x_clean = normalizer(x).float().cuda()
+        x_adv = normalizer(torch.cat([apply_patch(x[ind], (j, i)).unsqueeze(0) for ind in range(x.shape[0])], dim=0)).float().cuda() ## center of object
+        # x_adv = normalizer(apply_patch(x)).float() 
     
-          x_adv = normalizer(torch.cat([apply_patch(x[ind], (j, i)).unsqueeze(0) for ind in range(x.shape[0])], dim=0)).float().cuda() ## center of object
-          # x_adv = normalizer(apply_patch(x)).float() 
+        # Feed the model with the clean images
+        
+        output_clean = model(x_clean)
+        clean_predictions = torch.argmax(output_clean, dim=1).cpu().clone().detach()
+    
+        # Feed the model with the images corrupted by the patch
+        output_adv = model(x_adv)
+        adv_predictions = torch.argmax(output_adv, dim=1).cpu().clone().detach()
+        adv_scores = torch.softmax(output_adv, dim=1).cpu().clone().detach()[:,clean_predictions].diag()
+        #adv_predictions = torch.argmax(output_adv, dim=1).cpu().clone().detach()
+        
+        preds[0][f"{i,j}"] = clean_predictions
+        preds[1][f"{i,j}"] = adv_predictions
+        preds[2][f"{i,j}"] = adv_scores ## scores for best class
+        #preds[3]['x'] = x_clean.cpu()
+        bar.set_description(f"({i,j})/(112,112)")
+        
+  preds_total.append(preds)
+  torch.save(preds_total, f"temp_dataset/effect_stats/effect_predictions_{patch_id}_{args.size}.pt")
+  
+directory_name = f"dataset/effect/{patch_id}/{args.size}/"
+os.makedirs(directory_name)
+ilds = ImageLocationDataset(preds_total)
+print("saving dataset")
+for i in tqdm(range(len(ilds))):
+    img_name = ds.imgs[i].split("_")[-1].split(".")[0]
+    z = ilds[i]
+    z = torch.cat([z[1], z[0]], dim=0).numpy()
+    np.save(f"{directory_name}/{img_name}.npy", z)
+
+
+
       
-          # Feed the model with the clean images
-          
-          output_clean = model(x_clean)
-          clean_predictions = torch.argmax(output_clean, dim=1).cpu().clone().detach()
       
-          # Feed the model with the images corrupted by the patch
-          output_adv = model(x_adv)
-          adv_predictions = torch.argmax(output_adv, dim=1).cpu().clone().detach()
-          adv_scores = torch.softmax(output_adv, dim=1).cpu().clone().detach()[:,clean_predictions].diag()
-          #adv_predictions = torch.argmax(output_adv, dim=1).cpu().clone().detach()
-          
-          preds[0][f"{i,j}"] = clean_predictions
-          preds[1][f"{i,j}"] = adv_predictions
-          preds[2][f"{i,j}"] = adv_scores ## scores for best class
-          #preds[3]['x'] = x_clean.cpu()
-    preds_total.append(preds)
-    #directory = f"results/dataset_effect/{patch_id}/{args.size}/{args.model}"
-    #if not os.path.isdir(directory):
-    #  os.path.makedirs(directory)
-    f = gzip.open(f"results/dataset_effect/effect_predictions_{args.start}_{args.end}.pt", "w")
-    torch.save(preds_total, f)
-
-
-
-        
-        
-        
+      
